@@ -1,0 +1,135 @@
+"""Search and manage rental listings."""
+
+from threading import RLock
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException, Query, Response, status
+
+from propertyscout.rentals.models import (
+    AvailabilityStatus,
+    RentalEmirate,
+    RentalListing,
+    RentalListingCreate,
+    RentalPropertyType,
+)
+
+router = APIRouter(tags=["Rental Discovery"])
+
+# Temporary development storage. Replace with persistent storage later.
+_listings: dict[str, RentalListing] = {}
+_lock = RLock()
+
+
+@router.get("/rentals", response_model=list[RentalListing])
+def search_rentals(
+    emirate: RentalEmirate | None = None,
+    property_type: RentalPropertyType | None = None,
+    community: str | None = Query(default=None, min_length=1, max_length=150),
+    min_annual_rent: float | None = Query(default=None, ge=0),
+    max_annual_rent: float | None = Query(default=None, gt=0),
+    availability: AvailabilityStatus | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[RentalListing]:
+    """Search available records; an empty store returns an empty list."""
+    if (
+        min_annual_rent is not None
+        and max_annual_rent is not None
+        and min_annual_rent > max_annual_rent
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="min_annual_rent must not exceed max_annual_rent.",
+        )
+
+    with _lock:
+        results = list(_listings.values())
+
+    if emirate is not None:
+        results = [item for item in results if item.emirate == emirate]
+    if property_type is not None:
+        results = [item for item in results if item.property_type == property_type]
+    if community:
+        needle = community.strip().casefold()
+        results = [item for item in results if needle in item.community.casefold()]
+    if min_annual_rent is not None:
+        results = [
+            item for item in results
+            if item.annual_rent_aed >= min_annual_rent
+        ]
+    if max_annual_rent is not None:
+        results = [
+            item for item in results
+            if item.annual_rent_aed <= max_annual_rent
+        ]
+    if availability is not None:
+        results = [
+            item for item in results
+            if item.availability_status == availability
+        ]
+
+    return results[:limit]
+
+
+@router.post(
+    "/rentals",
+    response_model=RentalListing,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_rental(payload: RentalListingCreate) -> RentalListing:
+    """Register a listing supplied from an authorized source."""
+    listing_id = str(uuid4())
+    listing = RentalListing(id=listing_id, **payload.model_dump())
+
+    with _lock:
+        if listing.external_listing_id:
+            duplicate = any(
+                item.source_name.casefold() == listing.source_name.casefold()
+                and item.external_listing_id == listing.external_listing_id
+                for item in _listings.values()
+            )
+            if duplicate:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This source listing ID is already registered.",
+                )
+        _listings[listing_id] = listing
+
+    return listing
+
+
+@router.get("/rentals/{listing_id}", response_model=RentalListing)
+def get_rental(listing_id: str) -> RentalListing:
+    """Retrieve one rental listing."""
+    with _lock:
+        listing = _listings.get(listing_id)
+
+    if listing is None:
+        raise HTTPException(status_code=404, detail="Rental listing not found.")
+    return listing
+
+
+@router.patch(
+    "/rentals/{listing_id}/availability",
+    response_model=RentalListing,
+)
+def update_rental_availability(
+    listing_id: str,
+    availability: AvailabilityStatus,
+) -> RentalListing:
+    """Update a listing's explicitly recorded availability status."""
+    from datetime import date
+
+    with _lock:
+        listing = _listings.get(listing_id)
+        if listing is None:
+            raise HTTPException(status_code=404, detail="Rental listing not found.")
+
+        updated = listing.model_copy(
+            update={
+                "availability_status": availability,
+                "availability_checked_date": date.today(),
+            }
+        )
+        _listings[listing_id] = updated
+
+    return updated

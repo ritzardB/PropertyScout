@@ -9,6 +9,7 @@ from propertyscout.comparables.loaders import load_adrec, load_dld
 from propertyscout.comparables.matching import find_comparables
 from propertyscout.comparables.models import ComparableCriteria, ComparableSale
 from propertyscout.comparables.reporting import build_comparable_report
+from propertyscout.rentals.api import router as rentals_router
 
 
 app = FastAPI(
@@ -16,6 +17,9 @@ app = FastAPI(
     description="Property intelligence and market analytics for the UAE.",
     version="0.1.0",
 )
+
+
+app.include_router(rentals_router)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
