@@ -228,3 +228,56 @@ def test_upload_media_for_missing_listing_returns_404():
     )
 
     assert response.status_code == 404
+
+
+def test_cover_photo_can_be_changed():
+    created = client.post("/rentals", json=make_listing()).json()
+    listing_id = created["id"]
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+
+    first = client.post(
+        f"/rentals/{listing_id}/media",
+        files={"file": ("first.png", png_bytes, "image/png")},
+    )
+    second = client.post(
+        f"/rentals/{listing_id}/media",
+        files={"file": ("second.png", png_bytes, "image/png")},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["is_cover"] is True
+    assert second.json()["is_cover"] is False
+
+    filename = second.json()["filename"]
+    response = client.patch(
+        f"/rentals/{listing_id}/media/{filename}/cover"
+    )
+
+    assert response.status_code == 200
+
+    media = client.get(f"/rentals/{listing_id}/media").json()
+    covers = [item for item in media if item["is_cover"]]
+    assert len(covers) == 1
+    assert covers[0]["filename"] == filename
+
+
+def test_video_cannot_be_selected_as_cover():
+    created = client.post("/rentals", json=make_listing()).json()
+    listing_id = created["id"]
+
+    # Minimal MP4 signature accepted by the storage validator.
+    mp4_bytes = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8
+
+    uploaded = client.post(
+        f"/rentals/{listing_id}/media",
+        files={"file": ("sample.mp4", mp4_bytes, "video/mp4")},
+    )
+
+    assert uploaded.status_code == 201
+
+    response = client.patch(
+        f"/rentals/{listing_id}/media/{uploaded.json()['filename']}/cover"
+    )
+
+    assert response.status_code == 422

@@ -319,3 +319,47 @@ def get_rental_media(listing_id: str, filename: str) -> FileResponse:
         media_type=item["content_type"],
         filename=filename,
     )
+
+
+@router.patch("/rentals/{listing_id}/media/{filename}/cover")
+def set_rental_cover_photo(listing_id: str, filename: str) -> dict:
+    """Set an uploaded image as the rental listing's cover photo."""
+    _require_rental(listing_id)
+
+    with _lock:
+        items = _read_media_metadata(listing_id)
+
+        selected = next(
+            (item for item in items if item.get("filename") == filename),
+            None,
+        )
+
+        if selected is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Media file not found.",
+            )
+
+        if selected.get("media_type") != "image":
+            raise HTTPException(
+                status_code=422,
+                detail="Only images can be selected as the cover photo.",
+            )
+
+        media_dir = media_store.listing_media_dir(listing_id)
+        if not (media_dir / filename).is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="Media file not found.",
+            )
+
+        for item in items:
+            item["is_cover"] = item.get("filename") == filename
+
+        _write_media_metadata(listing_id, items)
+
+        return {
+            "message": "Cover photo updated.",
+            "filename": filename,
+            "is_cover": True,
+        }
