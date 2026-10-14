@@ -1,12 +1,20 @@
 """Persistent rental listing API."""
 
-from datetime import date
+
+"""Persistent rental listing API."""
+
+import json
+import os
+import tempfile
+from datetime import date, datetime, timezone
+from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 
-from propertyscout.rentals import csv_store
+from propertyscout.rentals import csv_store, media_store
 from propertyscout.rentals.models import (
     AvailabilityStatus,
     RentalEmirate,
@@ -16,8 +24,10 @@ from propertyscout.rentals.models import (
     RentalPropertyType,
 )
 
+
 router = APIRouter(tags=["Rental Discovery"])
 _lock = RLock()
+
 
 
 @router.get("/rentals", response_model=list[RentalListing])
@@ -172,3 +182,140 @@ def update_rental_availability(
                 return updated
 
     raise HTTPException(status_code=404, detail="Rental listing not found.")
+
+
+def _require_rental(listing_id: str) -> None:
+    """Raise 404 if the requested rental listing does not exist."""
+    with _lock:
+        if not any(
+            listing.id == listing_id
+            for listing in csv_store.load_rentals()
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Rental listing not found.",
+            )
+
+
+def _media_metadata_path(listing_id: str) -> Path:
+    """Return the metadata file for a listing's media."""
+    return media_store.listing_media_dir(listing_id) / "media.json"
+
+
+def _read_media_metadata(listing_id: str) -> list[dict]:
+    """Load media metadata, returning an empty list if none exists."""
+    metadata_path = _media_metadata_path(listing_id)
+
+    if not metadata_path.exists():
+        return []
+
+    try:
+        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read rental media metadata.",
+        ) from exc
+
+    if not isinstance(data, list):
+        raise HTTPException(
+            status_code=500,
+            detail="Rental media metadata has an invalid format.",
+        )
+
+    return data
+
+
+def _write_media_metadata(listing_id: str, items: list[dict]) -> None:
+    """Write metadata atomically to avoid partial JSON files."""
+    metadata_path = _media_metadata_path(listing_id)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=metadata_path.parent,
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temporary_path = Path(file.name)
+            json.dump(items, file, indent=2)
+
+        os.replace(temporary_path, metadata_path)
+
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
+
+
+@router.post(
+    "/rentals/{listing_id}/media",
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_rental_media(
+    listing_id: str,
+    file: UploadFile = File(...),
+) -> dict:
+    """Upload a photo or video for an existing rental listing."""
+    _require_rental(listing_id)
+
+    with _lock:
+        saved = await media_store.save_upload(listing_id, file)
+
+        items = _read_media_metadata(listing_id)
+        item = {
+            "id": uuid4().hex,
+            "filename": saved["filename"],
+            "media_type": saved["media_type"],
+            "content_type": saved["content_type"],
+            "size_bytes": saved["size_bytes"],
+            "url": f"/rentals/{listing_id}/media/{saved['filename']}",
+            "is_cover": not any(x.get("is_cover", False) for x in items)
+            and saved["media_type"] == "image",
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        items.append(item)
+        _write_media_metadata(listing_id, items)
+
+    return item
+
+
+@router.get("/rentals/{listing_id}/media")
+def list_rental_media(listing_id: str) -> list[dict]:
+    """List photos and videos attached to a rental listing."""
+    _require_rental(listing_id)
+
+    with _lock:
+        return _read_media_metadata(listing_id)
+
+
+@router.get("/rentals/{listing_id}/media/{filename}")
+def get_rental_media(listing_id: str, filename: str) -> FileResponse:
+    """Serve a previously uploaded media file."""
+    _require_rental(listing_id)
+
+    # Only serve files registered in this listing's metadata.
+    with _lock:
+        items = _read_media_metadata(listing_id)
+        item = next(
+            (x for x in items if x.get("filename") == filename),
+            None,
+        )
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Media file not found.")
+
+    directory = media_store.listing_media_dir(listing_id)
+    file_path = directory / filename
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Media file not found.")
+
+    return FileResponse(
+        path=file_path,
+        media_type=item["content_type"],
+        filename=filename,
+    )

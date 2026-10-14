@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from propertyscout import api
 from propertyscout.rentals import api as rentals_api
 from propertyscout.rentals import csv_store
+from propertyscout.rentals import media_store
 
 client = TestClient(api.app)
 
@@ -159,3 +160,71 @@ def test_create_personal_listing_without_source_url():
     listing = response.json()
     assert listing["source_url"] is None
     assert listing["listing_origin"] == "Personal Collection"
+
+
+@pytest.fixture(autouse=True)
+def isolate_rental_media(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        media_store,
+        "MEDIA_ROOT",
+        tmp_path / "media" / "rentals",
+    )
+
+
+def test_upload_and_retrieve_rental_image():
+    created = client.post("/rentals", json=make_listing()).json()
+    listing_id = created["id"]
+
+    # Minimal PNG signature accepted by the storage validator.
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+
+    uploaded = client.post(
+        f"/rentals/{listing_id}/media",
+        files={
+            "file": ("test.png", png_bytes, "image/png"),
+        },
+    )
+
+    assert uploaded.status_code == 201
+    media = uploaded.json()
+    assert media["media_type"] == "image"
+    assert media["is_cover"] is True
+
+    listing_media = client.get(f"/rentals/{listing_id}/media")
+    assert listing_media.status_code == 200
+    assert len(listing_media.json()) == 1
+
+    retrieved = client.get(
+        f"/rentals/{listing_id}/media/{media['filename']}"
+    )
+    assert retrieved.status_code == 200
+    assert retrieved.content == png_bytes
+    assert retrieved.headers["content-type"] == "image/png"
+
+
+def test_upload_rejects_unsupported_media_type():
+    created = client.post("/rentals", json=make_listing()).json()
+
+    response = client.post(
+        f"/rentals/{created['id']}/media",
+        files={
+            "file": ("script.txt", b"not an image", "text/plain"),
+        },
+    )
+
+    assert response.status_code == 415
+
+
+def test_upload_media_for_missing_listing_returns_404():
+    response = client.post(
+        "/rentals/nonexistent-listing/media",
+        files={
+            "file": (
+                "test.png",
+                b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+                "image/png",
+            ),
+        },
+    )
+
+    assert response.status_code == 404
